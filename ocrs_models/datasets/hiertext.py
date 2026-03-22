@@ -134,11 +134,21 @@ DEFAULT_ALPHABET = (
     " 0123456789!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
     + chr(8364)  # Euro symbol. Escaped to work around issue in Vim + tmux.
     + "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    # Tier 1 — French/West European accented characters
+    + "àâäéèêëïîôùûüçñößæœÀÂÄÉÈÊËÏÎÔÙÛÜÇÑÖŒÆ"
+    # Tier 2 — Extended Latin (Scandinavian, Icelandic, Czech, Slovak, Polish,
+    # Portuguese, Turkish, Romanian)
+    + "åøÅØðþÐÞšžŠŽčřďťňČŘĎŤŇąćęłńóśźżĄĆĘŁŃÓŚŹŻ"
+    + "ãõÃÕğışİĞŞțșȚȘăĂ"
+    # Tier 3 — Common symbols
+    + "©®™°²³¼½¾±×÷§¶†‡«»¿¡"
 )
 """
 Default alphabet used by text recognition models.
 
-This closely matches the English "gen2" model from EasyOCR.
+Includes ASCII, Euro symbol, Latin extended characters (French, Spanish,
+German, Portuguese, Scandinavian, Turkish, Polish, Czech, Romanian, etc.),
+and common typographic symbols.
 """
 
 

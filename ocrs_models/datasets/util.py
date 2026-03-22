@@ -1,6 +1,8 @@
 from collections.abc import Sized
 from typing import Optional
 
+import unicodedata
+
 import numpy as np
 from PIL import Image, ImageDraw
 from shapely.geometry import MultiLineString, JOIN_STYLE
@@ -110,6 +112,17 @@ def generate_mask(
     return torch.Tensor(mask)
 
 
+def normalize_text(text: str) -> str:
+    """
+    Normalize text using NFKC Unicode normalization.
+
+    This decomposes compatibility equivalents (e.g. ligatures like ``ﬁ`` → ``fi``,
+    superscripts like ``²`` → ``2``) while keeping precomposed accented
+    characters intact (e.g. ``é`` stays ``é``).
+    """
+    return unicodedata.normalize("NFKC", text)
+
+
 def encode_text(text: str, alphabet: list[str], unknown_char: str) -> torch.Tensor:
     """
     Convert `text` into a `[len(text)]` tensor of class indices.
@@ -118,7 +131,11 @@ def encode_text(text: str, alphabet: list[str], unknown_char: str) -> torch.Tens
     0 is reserved for the blank character. If a character is encountered in
     `text` which does not appear in `alphabet`, the character `unknown_char` is
     substituted.
+
+    Text is first normalized using NFKC to decompose ligatures and normalize
+    compatibility equivalents.
     """
+    text = normalize_text(text)
     x = torch.zeros(len(text), dtype=torch.int32)
     for i, ch in enumerate(text):
         try:

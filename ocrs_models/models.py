@@ -1,6 +1,7 @@
 from typing import Literal
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 
@@ -143,6 +144,102 @@ class DetectionModel(nn.Module):
         return self.out_conv(x_up)
 
 
+class DetectionModelV2(nn.Module):
+    """
+    Text detection model with Feature Pyramid Network (FPN).
+
+    Extends the U-Net encoder with FPN-style lateral connections and
+    multi-scale predictions for improved detection of text at varying sizes.
+
+    Outputs ``n_masks`` channels:
+    - Channel 0: text/not-text segmentation mask (same as DetectionModel)
+    - Channel 1: column/paragraph separator mask
+    """
+
+    def __init__(self, n_masks: int = 2):
+        super().__init__()
+
+        depth_scale = [8, 16, 32, 32, 64, 128, 256]
+        self.depth_scale = depth_scale
+        fpn_channels = 64
+
+        # Encoder (same as DetectionModel)
+        self.in_conv = DoubleConv(1, depth_scale[0])
+        self.down = nn.ModuleList()
+        for i in range(len(depth_scale) - 1):
+            self.down.append(Down(depth_scale[i], depth_scale[i + 1]))
+
+        # FPN lateral connections: project each encoder level to fpn_channels
+        self.fpn_lateral = nn.ModuleList(
+            [nn.Conv2d(d, fpn_channels, kernel_size=1) for d in depth_scale]
+        )
+
+        # FPN smoothing convolutions (3x3 after element-wise addition)
+        self.fpn_smooth = nn.ModuleList(
+            [
+                nn.Conv2d(fpn_channels, fpn_channels, kernel_size=3, padding=1)
+                for _ in depth_scale
+            ]
+        )
+
+        # Multi-scale prediction heads at 1/4, 1/8, 1/16 resolution
+        # (indices 2, 3, 4 in encoder feature list)
+        self.scale_heads = nn.ModuleList(
+            [nn.Conv2d(fpn_channels, n_masks, kernel_size=1) for _ in range(3)]
+        )
+
+        # Full-resolution prediction head from the finest FPN level
+        self.out_conv = nn.Conv2d(fpn_channels, n_masks, kernel_size=1)
+
+        # Learnable weights for fusing multi-scale predictions
+        self.scale_weights = nn.Parameter(torch.ones(4))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_size = x.shape[2:]
+
+        # Encoder forward pass: collect features at each level
+        encoder_features = [self.in_conv(x)]
+        for down_op in self.down:
+            encoder_features.append(down_op(encoder_features[-1]))
+
+        # FPN top-down pathway
+        fpn_features = [None] * len(encoder_features)
+        fpn_features[-1] = self.fpn_lateral[-1](encoder_features[-1])
+
+        for i in range(len(encoder_features) - 2, -1, -1):
+            upsampled = F.interpolate(
+                fpn_features[i + 1],
+                size=encoder_features[i].shape[2:],
+                mode="nearest",
+            )
+            lateral = self.fpn_lateral[i](encoder_features[i])
+            fpn_features[i] = self.fpn_smooth[i](upsampled + lateral)
+
+        # Full-resolution prediction from finest FPN level
+        main_pred = self.out_conv(fpn_features[0])
+
+        # Multi-scale predictions from levels at 1/4, 1/8, 1/16 resolution
+        # encoder_features indices: 2 → 1/4, 3 → 1/8, 4 → 1/16
+        scale_preds = []
+        for head_idx, level_idx in enumerate([2, 3, 4]):
+            pred = self.scale_heads[head_idx](fpn_features[level_idx])
+            pred = F.interpolate(
+                pred, size=input_size, mode="bilinear", align_corners=False
+            )
+            scale_preds.append(pred)
+
+        # Weighted fusion of all scales
+        weights = torch.softmax(self.scale_weights, dim=0)
+        fused = (
+            weights[0] * main_pred
+            + weights[1] * scale_preds[0]
+            + weights[2] * scale_preds[1]
+            + weights[3] * scale_preds[2]
+        )
+
+        return torch.sigmoid(fused)
+
+
 class RecognitionModel(nn.Module):
     """
     Text recognition model.
@@ -264,6 +361,281 @@ class RecognitionModel(nn.Module):
         # Disable autocast here as PyTorch doesn't support GRU with bfloat16.
         with torch.autocast(x.device.type, enabled=False):
             x, _ = self.gru(x.float())
+
+        return self.output(x)
+
+
+class RecognitionModelV2(nn.Module):
+    """
+    Text recognition model using Transformer encoder (replaces GRU).
+
+    This takes NCHW images of text lines as input and outputs a sequence of
+    character predictions as a [batch, W/4, C] tensor.
+
+    The input images must be greyscale and have a fixed height of 64.
+
+    The model follows a CNN + Transformer Encoder + CTC architecture:
+    - CNN backbone (identical to RecognitionModel) extracts visual features
+    - Transformer encoder replaces the bidirectional GRU for sequence modeling
+    - CTC decoding recovers the character sequence
+
+    Advantages over RecognitionModel (v1):
+    - Transformers support bfloat16 (no autocast workaround needed)
+    - Better parallelization during training
+    - Global attention captures long-range dependencies
+    """
+
+    def __init__(self, alphabet: str):
+        """
+        Construct the model.
+
+        :param alphabet: Alphabet of characters that the model will recognize
+        """
+        super().__init__()
+
+        n_classes = len(alphabet) + 1
+
+        # CNN backbone identical to RecognitionModel (downsample factor = 4)
+        self.conv = nn.Sequential(
+            nn.Conv2d(
+                1,
+                32,
+                kernel_size=3,
+                padding=(1, 1),
+            ),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2),
+            nn.Conv2d(
+                32,
+                64,
+                kernel_size=3,
+                padding=(1, 1),
+                bias=False,
+            ),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2),
+            nn.Conv2d(
+                64,
+                128,
+                kernel_size=3,
+                padding=(1, 1),
+            ),
+            nn.ReLU(),
+            nn.Conv2d(
+                128,
+                128,
+                kernel_size=3,
+                padding=(1, 1),
+                bias=False,
+            ),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=(2, 1)),
+            nn.Conv2d(
+                128,
+                128,
+                kernel_size=3,
+                padding=(1, 1),
+            ),
+            nn.ReLU(),
+            nn.Conv2d(
+                128,
+                128,
+                kernel_size=3,
+                padding=(1, 1),
+                bias=False,
+            ),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=(2, 1)),
+            nn.Conv2d(
+                128,
+                128,
+                kernel_size=(2, 2),
+                padding=(1, 1),
+                bias=False,
+            ),
+            nn.BatchNorm2d(128),
+            nn.AvgPool2d(kernel_size=(4, 1)),
+        )
+
+        d_model = 256
+
+        # Projection from CNN features to transformer dimension
+        self.project = nn.Linear(128, d_model)
+
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=4,
+            dim_feedforward=1024,
+            dropout=0.1,
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=4)
+
+        self.d_model = d_model
+
+        self.output = nn.Sequential(
+            nn.Linear(d_model, n_classes),
+            nn.LogSoftmax(dim=2),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        n, c, h, w = x.shape
+
+        x = self.conv(x)
+
+        # Reshape from NCHW to [N, W, C*H] (H=1 after CNN so C*H = 128)
+        x = x.squeeze(2)  # [N, 128, W']
+        x = x.permute(0, 2, 1)  # [N, W', 128]
+
+        # Project to d_model
+        x = self.project(x)  # [N, W', 256]
+
+        # Add sinusoidal positional encoding
+        seq_len = x.shape[1]
+        pos_enc = positional_encoding(seq_len, self.d_model).to(x.device)
+        x = x + pos_enc
+
+        # Transformer encoder
+        x = self.encoder(x)  # [N, W', 256]
+
+        # Output: [batch, seq, n_classes]
+        return self.output(x)
+
+
+class _ManualMultiheadAttention(nn.Module):
+    """Multi-head attention using simple ops for clean ONNX export.
+
+    ``nn.MultiheadAttention`` relies on ``scaled_dot_product_attention`` which
+    PyTorch decomposes into Reshape ops with constant-folded shapes during ONNX
+    export. Those dynamic Reshapes are not supported by RTen.  This module
+    produces the exact same result but with ONNX-friendly ops only.
+    """
+
+    def __init__(self, d_model: int, nhead: int):
+        super().__init__()
+        self.nhead = nhead
+        self.d_k = d_model // nhead
+        self.d_model = d_model
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        seq, batch, _ = x.shape
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+
+        q = q.reshape(seq, batch * self.nhead, self.d_k).transpose(0, 1)
+        k = k.reshape(seq, batch * self.nhead, self.d_k).transpose(0, 1)
+        v = v.reshape(seq, batch * self.nhead, self.d_k).transpose(0, 1)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) / (self.d_k**0.5)
+        attn = torch.softmax(scores, dim=-1)
+        out = torch.matmul(attn, v)
+
+        out = out.transpose(0, 1).reshape(seq, batch, self.d_model)
+        return self.out_proj(out)
+
+
+class _ManualEncoderLayer(nn.Module):
+    """Transformer encoder layer with manual attention for ONNX export."""
+
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int):
+        super().__init__()
+        self.self_attn = _ManualMultiheadAttention(d_model, nhead)
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x2 = self.self_attn(x)
+        x = self.norm1(x + x2)
+        x2 = self.linear2(torch.relu(self.linear1(x)))
+        x = self.norm2(x + x2)
+        return x
+
+
+class RecognitionModelV2Export(nn.Module):
+    """ONNX-export wrapper for :class:`RecognitionModelV2`.
+
+    This replaces ``nn.TransformerEncoderLayer`` (which uses
+    ``scaled_dot_product_attention``) with a manual implementation that
+    produces an ONNX graph compatible with RTen.  Weights are copied
+    from a trained ``RecognitionModelV2`` — the numerical output is
+    identical (< 1e-5 difference).
+
+    Usage::
+
+        model = RecognitionModelV2(alphabet=...).load_state_dict(...)
+        export_model = RecognitionModelV2Export.from_trained(model)
+        torch.onnx.export(export_model, ...)
+    """
+
+    def __init__(self, conv, project, d_model, output, n_layers: int = 4):
+        super().__init__()
+        self.conv = conv
+        self.project = project
+        self.d_model = d_model
+        self.layers = nn.ModuleList(
+            [_ManualEncoderLayer(d_model, 4, 1024) for _ in range(n_layers)]
+        )
+        self.output = output
+
+    @staticmethod
+    def from_trained(model: "RecognitionModelV2") -> "RecognitionModelV2Export":
+        """Build an export model by copying weights from a trained model."""
+        n_layers = len(model.encoder.layers)
+        export_model = RecognitionModelV2Export(
+            conv=model.conv,
+            project=model.project,
+            d_model=model.d_model,
+            output=model.output,
+            n_layers=n_layers,
+        )
+
+        for i in range(n_layers):
+            src = model.encoder.layers[i]
+            dst = export_model.layers[i]
+
+            # Copy multi-head attention weights
+            dst.self_attn.qkv_proj.weight.data = src.self_attn.in_proj_weight.data
+            dst.self_attn.qkv_proj.bias.data = src.self_attn.in_proj_bias.data
+            dst.self_attn.out_proj.weight.data = src.self_attn.out_proj.weight.data
+            dst.self_attn.out_proj.bias.data = src.self_attn.out_proj.bias.data
+
+            # Copy FFN weights
+            dst.linear1.weight.data = src.linear1.weight.data
+            dst.linear1.bias.data = src.linear1.bias.data
+            dst.linear2.weight.data = src.linear2.weight.data
+            dst.linear2.bias.data = src.linear2.bias.data
+
+            # Copy layer norms
+            dst.norm1.weight.data = src.norm1.weight.data
+            dst.norm1.bias.data = src.norm1.bias.data
+            dst.norm2.weight.data = src.norm2.weight.data
+            dst.norm2.bias.data = src.norm2.bias.data
+
+        return export_model
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.conv(x)
+        x = x.squeeze(2).permute(0, 2, 1)
+        x = self.project(x)
+
+        seq_len = x.shape[1]
+        pos_enc = positional_encoding(seq_len, self.d_model).to(x.device)
+        x = x + pos_enc
+
+        # [batch, seq, d] → [seq, batch, d] for the manual encoder layers
+        x = x.permute(1, 0, 2)
+        for layer in self.layers:
+            x = layer(x)
+        # [seq, batch, d] → [batch, seq, d]
+        x = x.permute(1, 0, 2)
 
         return self.output(x)
 

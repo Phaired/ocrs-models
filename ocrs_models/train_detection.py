@@ -14,9 +14,11 @@ import torchvision.transforms as transforms
 from tqdm import tqdm
 import wandb
 
+from .datasets.combined import CombinedDataset
 from .datasets.ddi100 import DDI100
 from .datasets.hiertext import HierText
-from .models import DetectionModel
+from .datasets.textocr import TextOCR
+from .models import DetectionModel, DetectionModelV2
 from .postprocess import box_match_metrics, extract_cc_quads
 
 mask_height = 800
@@ -94,6 +96,7 @@ def train(
         loss = loss_fn(pred_masks, masks)
         optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=4.0)
         optimizer.step()
         train_loss += loss.item()
 
@@ -263,6 +266,29 @@ def balanced_cross_entropy_loss(
     return torch.cat([pos_topk_vals, neg_topk_vals]).mean()
 
 
+def dice_bce_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """
+    Combined Dice + BCE loss for text detection.
+
+    Dice loss handles class imbalance better than pure BCE by measuring
+    overlap between predicted and target masks. Combined with BCE for
+    stability.
+    """
+    target = target.clamp(0.0, 1.0)
+
+    # Dice loss
+    smooth = 1.0
+    pred_flat = pred.flatten()
+    target_flat = target.flatten()
+    intersection = (pred_flat * target_flat).sum()
+    dice = 1.0 - (2.0 * intersection + smooth) / (pred_flat.sum() + target_flat.sum() + smooth)
+
+    # BCE loss (balanced)
+    bce = balanced_cross_entropy_loss(pred, target)
+
+    return dice + bce
+
+
 def prepare_transform(mask_size: tuple[int, int], augment) -> nn.Module:
     """
     Prepare image transforms to be applied to input images and text masks.
@@ -274,28 +300,50 @@ def prepare_transform(mask_size: tuple[int, int], augment) -> nn.Module:
     if not augment:
         return resize_transform
 
-    augmentations = transforms.RandomApply(
+    # Geometric augmentations applied to stacked [img, mask] tensor
+    geometric_augs = transforms.RandomApply(
         [
             transforms.RandomChoice(
                 [
-                    transforms.ColorJitter(brightness=0.1, contrast=0.1),
                     transforms.RandomAffine(degrees=5, scale=(0.8, 1.2), shear=5),
                     transforms.RandomPerspective(distortion_scale=0.1, p=1.0),
                     transforms.RandomCrop(size=600, pad_if_needed=True),
+                    transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0)),
                 ]
             )
         ],
         p=0.5,
     )
-    return transforms.Compose([augmentations, resize_transform])
+
+    # Visual augmentations applied only to the image channel (not mask)
+    class ImageOnlyColorJitter(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.jitter = transforms.ColorJitter(brightness=0.3, contrast=0.3)
+
+        def forward(self, x):
+            # x is [img, mask] stacked (2 channels)
+            if x.shape[0] >= 2:
+                img = x[0:1]  # 1×H×W
+                mask = x[1:]
+                img = self.jitter(img)
+                return torch.cat([img, mask], dim=0)
+            return x
+
+    color_aug = transforms.RandomApply([ImageOnlyColorJitter()], p=0.3)
+
+    return transforms.Compose([geometric_augs, color_aug, resize_transform])
 
 
 def main():
     parser = ArgumentParser(description="Train text detection model.")
     parser.add_argument(
-        "dataset_type", type=str, choices=["ddi", "hiertext"], help="Format of dataset"
+        "dataset_type", type=str, choices=["ddi", "hiertext", "combined"], help="Format of dataset"
     )
     parser.add_argument("data_dir")
+    parser.add_argument(
+        "--textocr-dir", type=str, help="Path to TextOCR dataset (for combined mode)"
+    )
     parser.add_argument("--batch-size", type=int, default=4, help="Batch size")
     parser.add_argument("--checkpoint", type=str, help="Model checkpoint to load")
     parser.add_argument(
@@ -321,12 +369,29 @@ def main():
         action=BooleanOptionalAction,
         help="Enable data augmentation",
     )
+    parser.add_argument(
+        "--model-version",
+        type=str,
+        choices=["v1", "v2"],
+        default="v1",
+        help="Model architecture version: v1 (U-Net) or v2 (U-Net + FPN, multi-head)",
+    )
+    parser.add_argument(
+        "--num-workers", type=int, default=8, help="DataLoader worker processes"
+    )
+    parser.add_argument("--lr", type=float, help="Learning rate")
+    parser.add_argument(
+        "--loss", type=str, choices=["bce", "dice"], default="bce",
+        help="Loss function: bce (balanced cross-entropy) or dice (dice+bce combined)",
+    )
     args = parser.parse_args()
 
     if args.dataset_type == "ddi":
         load_dataset = DDI100
     elif args.dataset_type == "hiertext":
         load_dataset = HierText
+    elif args.dataset_type == "combined":
+        load_dataset = None  # handled below
     else:
         raise Exception(f"Unknown dataset type {args.dataset_type}")
 
@@ -344,25 +409,48 @@ def main():
 
     transform = prepare_transform(mask_size, augment=args.augment)
 
-    train_dataset = load_dataset(
-        args.data_dir, transform=transform, train=True, max_images=max_images
-    )
+    if args.dataset_type == "combined":
+        if not args.textocr_dir:
+            raise Exception("--textocr-dir required for combined dataset")
+        hiertext_train = HierText(args.data_dir, transform=transform, train=True, max_images=max_images)
+        textocr_train = TextOCR(args.textocr_dir, transform=transform, train=True, max_images=max_images)
+        # 60% HierText, 40% TextOCR
+        train_dataset = CombinedDataset(
+            datasets=[hiertext_train, textocr_train],
+            ratios=[0.6, 0.4],
+        )
+    else:
+        train_dataset = load_dataset(
+            args.data_dir, transform=transform, train=True, max_images=max_images
+        )
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         pin_memory=True,
-        num_workers=2,
+        num_workers=args.num_workers,
+        persistent_workers=args.num_workers > 0,
     )
 
-    val_dataset = load_dataset(
-        args.data_dir,
-        transform=transform,
-        train=False,
-        max_images=validation_max_images,
-    )
+    if args.dataset_type == "combined":
+        # Validate on HierText only (consistent baseline)
+        val_dataset = HierText(
+            args.data_dir, transform=transform, train=False,
+            max_images=validation_max_images,
+        )
+    else:
+        val_dataset = load_dataset(
+            args.data_dir,
+            transform=transform,
+            train=False,
+            max_images=validation_max_images,
+        )
     val_dataloader = DataLoader(
-        val_dataset, batch_size=batch_size, pin_memory=True, num_workers=2
+        val_dataset,
+        batch_size=batch_size,
+        pin_memory=True,
+        num_workers=args.num_workers,
+        persistent_workers=args.num_workers > 0,
     )
 
     print(
@@ -373,12 +461,21 @@ def main():
     )
 
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    model = DetectionModel().to(device)
+    if args.model_version == "v2":
+        # Use n_masks=1 for now: HierText only provides text/non-text masks.
+        # n_masks=2 (with separator channel) requires a dataset with column
+        # separator annotations.
+        model = DetectionModelV2(n_masks=1).to(device)
+    else:
+        model = DetectionModel().to(device)
 
-    optimizer = torch.optim.Adam(model.parameters())
+    lr = args.lr if hasattr(args, 'lr') and args.lr else (3e-4 if args.model_version == "v2" else 1e-3)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model param count: {total_params}")
+
+    loss_fn = dice_bce_loss if args.loss == "dice" else balanced_cross_entropy_loss
+    print(f"Model param count: {total_params}, lr: {lr}, loss: {args.loss}")
 
     epochs_without_improvement = 0
     min_train_loss = 1.0
@@ -401,7 +498,10 @@ def main():
             args.export,
             input_names=["image"],
             output_names=["mask"],
-            dynamic_axes={"image": {0: "batch"}, "mask": {0: "batch"}},
+            dynamic_axes={
+                "image": {0: "batch", 2: "height", 3: "width"},
+                "mask": {0: "batch", 2: "height", 3: "width"},
+            },
         )
         return
 
@@ -416,7 +516,7 @@ def main():
             device,
             val_dataloader,
             model,
-            balanced_cross_entropy_loss,
+            loss_fn,
             save_debug_images=args.debug_images,
         )
         print(f"Validation loss {val_loss:.4f}")
@@ -433,6 +533,7 @@ def main():
                 "dataset_size": len(train_dataset),
                 "model_params": total_params,
                 "pytorch_seed": pytorch_seed,
+                "loss": args.loss,
             },
         )
         wandb.watch(model)
@@ -443,7 +544,7 @@ def main():
             device,
             train_dataloader,
             model,
-            balanced_cross_entropy_loss,
+            loss_fn,
             optimizer,
             save_debug_images=args.debug_images,
         )
@@ -451,7 +552,7 @@ def main():
             device,
             val_dataloader,
             model,
-            balanced_cross_entropy_loss,
+            loss_fn,
             save_debug_images=args.debug_images,
         )
         print(
@@ -477,10 +578,11 @@ def main():
         else:
             epochs_without_improvement += 1
 
-        if epochs_without_improvement > 3:
+        if epochs_without_improvement > 8:
             print(
                 f"Stopping after {epochs_without_improvement} epochs without train loss improvement"
             )
+            break
 
         epoch += 1
 

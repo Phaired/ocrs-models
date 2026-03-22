@@ -10,10 +10,12 @@ from torch.utils.data import DataLoader, default_collate
 from tqdm import tqdm
 import wandb
 
+from .datasets.combined import CombinedDataset
 from .datasets.hiertext import DEFAULT_ALPHABET, HierTextRecognition
+from .datasets.textocr import TextOCRRecognition
 from .datasets.util import ctc_greedy_decode_text, decode_text
 from .datasets import text_recognition_data_augmentations
-from .models import RecognitionModel
+from .models import RecognitionModel, RecognitionModelV2, RecognitionModelV2Export
 from .train_detection import load_checkpoint, save_checkpoint
 
 
@@ -88,6 +90,7 @@ def train(
     dataloader: DataLoader,
     model: RecognitionModel,
     optimizer: torch.optim.Optimizer,
+    model_version: str = "v1",
 ) -> tuple[float, RecognitionAccuracyStats]:
     """
     Run one epoch of training.
@@ -116,8 +119,13 @@ def train(
         optimizer.zero_grad()
 
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-            # Predict [seq, batch, class] from [batch, 1, height, width].
             pred_seq = model(img)
+
+            # v2 outputs [batch, seq, class]; convert to [seq, batch, class]
+            # for CTCLoss and stats compatibility.
+            if model_version == "v2":
+                pred_seq = pred_seq.permute(1, 0, 2)
+
             batch_loss = loss(pred_seq, text_seq, input_lengths, target_lengths)
 
         stats.update(text_seq, target_lengths, pred_seq, input_lengths)
@@ -164,6 +172,7 @@ def test(
     device: torch.device,
     dataloader: DataLoader,
     model: RecognitionModel,
+    model_version: str = "v1",
 ) -> tuple[float, RecognitionAccuracyStats]:
     """
     Run evaluation on a set of images.
@@ -189,8 +198,12 @@ def test(
             text_seq = batch["text_seq"].to(device)
             target_lengths = batch["text_len"]
 
-            # Predict [seq, batch, class] from [batch, 1, height, width].
             pred_seq = model(img)
+
+            # v2 outputs [batch, seq, class]; convert to [seq, batch, class]
+            # for CTCLoss and stats compatibility.
+            if model_version == "v2":
+                pred_seq = pred_seq.permute(1, 0, 2)
 
             stats.update(text_seq, target_lengths, pred_seq, input_lengths)
 
@@ -306,7 +319,7 @@ def collate_samples(samples: list[dict]) -> dict:
 
 def main():
     parser = ArgumentParser(description="Train text recognition model.")
-    parser.add_argument("dataset_type", type=str, choices=["hiertext"])
+    parser.add_argument("dataset_type", type=str, choices=["hiertext", "textocr", "combined"])
     parser.add_argument("data_dir")
     parser.add_argument(
         "--augment",
@@ -315,7 +328,9 @@ def main():
         help="Enable data augmentations",
     )
     parser.add_argument("--batch-size", type=int, default=20)
+    parser.add_argument("--num-workers", type=int, default=8, help="DataLoader worker processes")
     parser.add_argument("--checkpoint", type=str, help="Model checkpoint to load")
+    parser.add_argument("--textocr-dir", type=str, help="Path to TextOCR dataset (for combined mode)")
     parser.add_argument("--export", type=str, help="Export model to ONNX format")
     parser.add_argument("--lr", type=float, help="Initial learning rate")
     parser.add_argument(
@@ -323,6 +338,13 @@ def main():
     )
     parser.add_argument(
         "--max-images", type=int, help="Maximum number of items to train on"
+    )
+    parser.add_argument(
+        "--model-version",
+        type=str,
+        choices=["v1", "v2"],
+        default="v1",
+        help="Model architecture version: v1 (CRNN/GRU) or v2 (CNN+Transformer)",
     )
     parser.add_argument(
         "--validate-only",
@@ -337,6 +359,10 @@ def main():
 
     if args.dataset_type == "hiertext":
         load_dataset = HierTextRecognition
+    elif args.dataset_type == "textocr":
+        load_dataset = TextOCRRecognition
+    elif args.dataset_type == "combined":
+        load_dataset = None  # handled below
     else:
         raise Exception(f"Unknown dataset type {args.dataset_type}")
 
@@ -351,38 +377,81 @@ def main():
     else:
         augmentations = None
 
-    train_dataset = load_dataset(
-        args.data_dir, train=True, max_images=max_images, transform=augmentations
-    )
+    if args.dataset_type == "combined":
+        if not args.textocr_dir:
+            raise Exception("--textocr-dir required for combined dataset")
+        hiertext_train = HierTextRecognition(
+            args.data_dir, train=True, max_images=max_images, transform=augmentations
+        )
+        textocr_train = TextOCRRecognition(
+            args.textocr_dir, train=True, max_images=max_images, transform=augmentations
+        )
+        # 60% HierText, 40% TextOCR
+        train_dataset = CombinedDataset(
+            datasets=[hiertext_train, textocr_train],
+            ratios=[0.6, 0.4],
+        )
+    else:
+        train_dataset = load_dataset(
+            args.data_dir, train=True, max_images=max_images, transform=augmentations
+        )
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=collate_samples,
-        num_workers=2,
+        num_workers=args.num_workers,
         pin_memory=True,
+        persistent_workers=args.num_workers > 0,
     )
 
-    val_dataset = load_dataset(
-        args.data_dir, train=False, max_images=validation_max_images
-    )
+    if args.dataset_type == "combined":
+        # Validate on HierText only (consistent baseline)
+        val_dataset = HierTextRecognition(
+            args.data_dir, train=False, max_images=validation_max_images
+        )
+    else:
+        val_dataset = load_dataset(
+            args.data_dir, train=False, max_images=validation_max_images
+        )
     val_dataloader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=collate_samples,
-        num_workers=2,
+        num_workers=args.num_workers,
         pin_memory=True,
+        persistent_workers=args.num_workers > 0,
     )
 
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    model = RecognitionModel(alphabet=DEFAULT_ALPHABET).to(device)
+    model_version = args.model_version
 
-    initial_lr = args.lr or 1e-3  # 1e-3 is the Adam default
-    optimizer = torch.optim.Adam(model.parameters(), lr=initial_lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, factor=0.1, patience=3
-    )
+    if model_version == "v2":
+        model = RecognitionModelV2(alphabet=DEFAULT_ALPHABET).to(device)
+        initial_lr = args.lr or 3e-4
+        optimizer = torch.optim.Adam(model.parameters(), lr=initial_lr)
+        warmup_epochs = 3
+        total_epochs = args.max_epochs or 100
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[
+                torch.optim.lr_scheduler.LinearLR(
+                    optimizer, start_factor=0.1, total_iters=warmup_epochs
+                ),
+                torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=max(1, total_epochs - warmup_epochs)
+                ),
+            ],
+            milestones=[warmup_epochs],
+        )
+    else:
+        model = RecognitionModel(alphabet=DEFAULT_ALPHABET).to(device)
+        initial_lr = args.lr or 1e-3  # 1e-3 is the Adam default
+        optimizer = torch.optim.Adam(model.parameters(), lr=initial_lr)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, factor=0.1, patience=3
+        )
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model param count {total_params}")
@@ -395,21 +464,44 @@ def main():
 
     if args.export:
         test_batch = next(iter(val_dataloader))
+        if model_version == "v2":
+            # Wrap v2 model for ONNX export to avoid RTen-incompatible
+            # Reshape ops generated by nn.MultiheadAttention / SDPA.
+            export_model = RecognitionModelV2Export.from_trained(model).to(device)
+            export_model.eval()
+            dynamic_axes = {
+                "line_image": {0: "batch", 3: "seq"},
+                "chars": {0: "batch", 1: "out_seq"},
+            }
+        else:
+            export_model = model
+            dynamic_axes = {
+                "line_image": {0: "batch", 3: "seq"},
+                "chars": {0: "out_seq"},
+            }
         torch.onnx.export(
-            model,
+            export_model,
             test_batch["image"].to(device),
             args.export,
             input_names=["line_image"],
             output_names=["chars"],
-            dynamic_axes={
-                "line_image": {0: "batch", 3: "seq"},
-                "chars": {0: "out_seq"},
-            },
+            dynamic_axes=dynamic_axes,
         )
+
+        # Embed alphabet as ONNX metadata so the runtime can read it
+        # instead of relying on a hardcoded alphabet.
+        import onnx
+        onnx_model = onnx.load(args.export)
+        onnx_model.metadata_props.append(
+            onnx.StringStringEntryProto(key="alphabet", value=DEFAULT_ALPHABET)
+        )
+        onnx.save(onnx_model, args.export)
+        print(f"Exported with alphabet metadata ({len(DEFAULT_ALPHABET)} chars)")
+
         return
 
     if args.validate_only:
-        val_loss, val_stats = test(device, val_dataloader, model)
+        val_loss, val_stats = test(device, val_dataloader, model, model_version)
         print(
             f"Validation loss {val_loss} char error rate {val_stats.char_error_rate()}"
         )
@@ -431,19 +523,22 @@ def main():
 
     while args.max_epochs is None or epoch < args.max_epochs:
         train_loss, train_stats = train(
-            epoch, device, train_dataloader, model, optimizer
+            epoch, device, train_dataloader, model, optimizer, model_version
         )
 
         print(
             f"Epoch {epoch} train loss {train_loss} char error rate {train_stats.char_error_rate()}"
         )
 
-        val_loss, val_stats = test(device, val_dataloader, model)
+        val_loss, val_stats = test(device, val_dataloader, model, model_version)
         print(
             f"Epoch {epoch} validation loss {val_loss} char error rate {val_stats.char_error_rate()}"
         )
 
-        scheduler.step(val_loss)
+        if model_version == "v2":
+            scheduler.step()
+        else:
+            scheduler.step(val_loss)
 
         print(f"Current learning rate {scheduler.get_last_lr()}")
 

@@ -478,7 +478,7 @@ def main():
     print(f"Model param count: {total_params}, lr: {lr}, loss: {args.loss}")
 
     epochs_without_improvement = 0
-    min_train_loss = 1.0
+    min_train_loss = float("inf")
     epoch = 0
 
     if args.checkpoint:

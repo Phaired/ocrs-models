@@ -270,4 +270,5 @@ class TextOCRRecognition(SizedDataset):
             "image_id": img_id,
             "image": line_img,
             "text_seq": text_seq,
+            "text": text,
         }

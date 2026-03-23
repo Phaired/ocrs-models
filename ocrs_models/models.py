@@ -506,6 +506,287 @@ class RecognitionModelV2(nn.Module):
         return self.output(x)
 
 
+class RecognitionModelV3(nn.Module):
+    """
+    Text recognition model with autoregressive Transformer decoder.
+
+    Architecture: CNN backbone + Transformer Encoder + Transformer Decoder.
+    Unlike v1 (CTC+GRU) and v2 (CTC+Transformer Encoder), this model uses
+    cross-attention between the decoder and encoder features, allowing each
+    predicted character to attend to the full visual context and previous
+    predictions. This resolves CTC's independence assumption that causes
+    confusions between visually similar characters (w/v, 0/o, d/a).
+
+    Special tokens:
+    - 0: PAD
+    - 1: SOS (start of sequence)
+    - 2: EOS (end of sequence)
+    - 3+: alphabet characters (alphabet[i] = token i+3)
+    """
+
+    PAD_TOKEN = 0
+    SOS_TOKEN = 1
+    EOS_TOKEN = 2
+    CHAR_OFFSET = 3
+
+    def __init__(self, alphabet: str, max_seq_len: int = 150):
+        super().__init__()
+
+        self.alphabet = alphabet
+        self.max_seq_len = max_seq_len
+        vocab_size = len(alphabet) + self.CHAR_OFFSET  # PAD + SOS + EOS + chars
+
+        # CNN backbone (same as v1/v2)
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=(1, 1)),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=(1, 1), bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=(1, 1)),
+            nn.ReLU(),
+            nn.Conv2d(128, 128, kernel_size=3, padding=(1, 1), bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=(2, 1)),
+            nn.Conv2d(128, 128, kernel_size=3, padding=(1, 1)),
+            nn.ReLU(),
+            nn.Conv2d(128, 128, kernel_size=3, padding=(1, 1), bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=(2, 1)),
+            nn.Conv2d(128, 128, kernel_size=(2, 2), padding=(1, 1), bias=False),
+            nn.BatchNorm2d(128),
+            nn.AvgPool2d(kernel_size=(4, 1)),
+        )
+
+        d_model = 256
+        self.d_model = d_model
+
+        # Project CNN features to d_model
+        self.project = nn.Linear(128, d_model)
+
+        # Transformer encoder (same as v2)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=4,
+            dim_feedforward=1024,
+            dropout=0.1,
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=4)
+
+        # Decoder components
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=4,
+            dim_feedforward=1024,
+            dropout=0.1,
+            batch_first=True,
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=2)
+
+        self.output_proj = nn.Linear(d_model, vocab_size)
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Run CNN + encoder on image. Returns encoder memory."""
+        x = self.conv(x)
+        x = x.squeeze(2)  # [N, 128, W']
+        x = x.permute(0, 2, 1)  # [N, W', 128]
+        x = self.project(x)  # [N, W', 256]
+
+        seq_len = x.shape[1]
+        pos_enc = positional_encoding(seq_len, self.d_model).to(x.device)
+        x = x + pos_enc
+
+        return self.encoder(x)  # [N, W', 256]
+
+    def decode(
+        self, memory: torch.Tensor, tgt_tokens: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Run decoder on target tokens with encoder memory.
+
+        :param memory: [N, src_len, d_model] encoder output
+        :param tgt_tokens: [N, tgt_len] token indices
+        :return: [N, tgt_len, vocab_size] logits
+        """
+        tgt_len = tgt_tokens.shape[1]
+
+        # Token embedding + positional encoding
+        tgt = self.token_embedding(tgt_tokens)  # [N, tgt_len, d_model]
+        pos_enc = positional_encoding(tgt_len, self.d_model).to(tgt.device)
+        tgt = tgt + pos_enc
+
+        # Causal mask: prevent attending to future tokens
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(
+            tgt_len, device=tgt.device
+        )
+
+        out = self.decoder(tgt, memory, tgt_mask=causal_mask)  # [N, tgt_len, d_model]
+        return self.output_proj(out)  # [N, tgt_len, vocab_size]
+
+    def forward(
+        self, x: torch.Tensor, tgt_tokens: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """
+        Forward pass.
+
+        During training, pass tgt_tokens for teacher forcing.
+        During inference (tgt_tokens=None), decode autoregressively.
+        """
+        memory = self.encode(x)
+
+        if tgt_tokens is not None:
+            # Training: teacher forcing
+            return self.decode(memory, tgt_tokens)
+
+        # Inference: autoregressive decoding
+        return self.inference(memory)
+
+    @torch.no_grad()
+    def inference(self, memory: torch.Tensor) -> torch.Tensor:
+        """Autoregressive greedy decoding."""
+        batch_size = memory.shape[0]
+        device = memory.device
+
+        # Start with SOS token
+        tokens = torch.full(
+            (batch_size, 1), self.SOS_TOKEN, dtype=torch.long, device=device
+        )
+
+        for _ in range(self.max_seq_len):
+            logits = self.decode(memory, tokens)  # [N, seq, vocab]
+            next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)  # [N, 1]
+            tokens = torch.cat([tokens, next_token], dim=1)
+
+            # Stop if all sequences have produced EOS
+            if (next_token == self.EOS_TOKEN).all():
+                break
+
+        return tokens  # [N, seq_len] token indices
+
+    def encode_target(self, text: str) -> torch.Tensor:
+        """Convert text string to target token sequence (with SOS/EOS)."""
+        alphabet_list = list(self.alphabet)
+        tokens = [self.SOS_TOKEN]
+        for ch in text:
+            try:
+                idx = alphabet_list.index(ch)
+                tokens.append(idx + self.CHAR_OFFSET)
+            except ValueError:
+                # Unknown char — skip
+                pass
+        tokens.append(self.EOS_TOKEN)
+        return torch.tensor(tokens, dtype=torch.long)
+
+    def decode_tokens(self, tokens: torch.Tensor | list[int]) -> str:
+        """Convert token indices back to text string."""
+        if isinstance(tokens, torch.Tensor):
+            tokens = tokens.tolist()
+        alphabet_list = list(self.alphabet)
+        chars = []
+        for t in tokens:
+            if t == self.EOS_TOKEN:
+                break
+            if t >= self.CHAR_OFFSET:
+                idx = t - self.CHAR_OFFSET
+                if idx < len(alphabet_list):
+                    chars.append(alphabet_list[idx])
+        return "".join(chars)
+
+
+class RecognitionModelV3Export(nn.Module):
+    """ONNX-export wrapper for RecognitionModelV3.
+
+    Exports two entry points:
+    - encode(image) -> memory
+    - decode(memory, tokens) -> logits
+
+    For ONNX we export them as a single model with the encoder part.
+    The autoregressive loop happens in the Rust runtime.
+    """
+
+    def __init__(self, conv, project, d_model, encoder_layers, decoder, token_embedding, output_proj):
+        super().__init__()
+        self.conv = conv
+        self.project = project
+        self.d_model = d_model
+        self.encoder_layers = encoder_layers
+        self.decoder = decoder
+        self.token_embedding = token_embedding
+        self.output_proj = output_proj
+
+    @staticmethod
+    def from_trained(model: "RecognitionModelV3") -> "RecognitionModelV3Export":
+        """Build export model from trained model."""
+        n_layers = len(model.encoder.layers)
+        encoder_layers = nn.ModuleList(
+            [_ManualEncoderLayer(model.d_model, 4, 1024) for _ in range(n_layers)]
+        )
+        # Copy encoder weights
+        for i in range(n_layers):
+            src = model.encoder.layers[i]
+            dst = encoder_layers[i]
+            dst.self_attn.qkv_proj.weight.data = src.self_attn.in_proj_weight.data
+            dst.self_attn.qkv_proj.bias.data = src.self_attn.in_proj_bias.data
+            dst.self_attn.out_proj.weight.data = src.self_attn.out_proj.weight.data
+            dst.self_attn.out_proj.bias.data = src.self_attn.out_proj.bias.data
+            dst.linear1.weight.data = src.linear1.weight.data
+            dst.linear1.bias.data = src.linear1.bias.data
+            dst.linear2.weight.data = src.linear2.weight.data
+            dst.linear2.bias.data = src.linear2.bias.data
+            dst.norm1.weight.data = src.norm1.weight.data
+            dst.norm1.bias.data = src.norm1.bias.data
+            dst.norm2.weight.data = src.norm2.weight.data
+            dst.norm2.bias.data = src.norm2.bias.data
+
+        return RecognitionModelV3Export(
+            conv=model.conv,
+            project=model.project,
+            d_model=model.d_model,
+            encoder_layers=encoder_layers,
+            decoder=model.decoder,
+            token_embedding=model.token_embedding,
+            output_proj=model.output_proj,
+        )
+
+    def forward(self, image: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Single forward pass: encode image + decode tokens.
+        The Rust runtime calls this repeatedly with growing token sequences.
+        """
+        # Encode
+        x = self.conv(image)
+        x = x.squeeze(2).permute(0, 2, 1)
+        x = self.project(x)
+
+        seq_len = x.shape[1]
+        pos_enc = positional_encoding(seq_len, self.d_model).to(x.device)
+        x = x + pos_enc
+
+        # Manual encoder (ONNX-friendly)
+        x = x.permute(1, 0, 2)  # [seq, batch, d]
+        for layer in self.encoder_layers:
+            x = layer(x)
+        memory = x.permute(1, 0, 2)  # [batch, seq, d]
+
+        # Decode
+        tgt_len = tokens.shape[1]
+        tgt = self.token_embedding(tokens)
+        tgt_pos = positional_encoding(tgt_len, self.d_model).to(tgt.device)
+        tgt = tgt + tgt_pos
+
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(
+            tgt_len, device=tgt.device
+        )
+        out = self.decoder(tgt, memory, tgt_mask=causal_mask)
+        return self.output_proj(out)  # [N, tgt_len, vocab_size]
+
+
 class _ManualMultiheadAttention(nn.Module):
     """Multi-head attention using simple ops for clean ONNX export.
 

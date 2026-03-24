@@ -299,6 +299,7 @@ class SyntheticTextDataset(SizedDataset):
         max_images: Optional[int] = None,
         output_height: int = 64,
         seed: Optional[int] = None,
+        random_ratio: float = 0.3,
     ):
         """
         :param num_samples: Virtual size of the dataset.
@@ -313,6 +314,9 @@ class SyntheticTextDataset(SizedDataset):
         :param seed: If set, each ``__getitem__`` call uses
             ``seed + idx`` as its RNG seed, making the dataset fully
             reproducible.
+        :param random_ratio: Fraction of samples that use random alphabet
+            sequences instead of word-based text. Ensures all characters
+            get sufficient training examples.
         """
         super().__init__()
 
@@ -321,6 +325,7 @@ class SyntheticTextDataset(SizedDataset):
         self.transform = transform
         self.output_height = output_height
         self._seed = seed
+        self._random_ratio = random_ratio
 
         # Pre-discover fonts once.
         self._fonts = _get_system_fonts()
@@ -344,7 +349,10 @@ class SyntheticTextDataset(SizedDataset):
     def __getitem__(self, idx: int) -> dict:
         rng = random.Random(self._seed + idx if self._seed is not None else None)
 
-        text = self._sample_text_line(rng)
+        if rng.random() < self._random_ratio:
+            text = self._sample_random_alphabet(rng)
+        else:
+            text = self._sample_text_line(rng)
         line_img = self._render_line(text, rng)
         img_tensor = self._pil_to_tensor(line_img)
 
@@ -375,6 +383,24 @@ class SyntheticTextDataset(SizedDataset):
     # ------------------------------------------------------------------
     # Text sampling
     # ------------------------------------------------------------------
+
+    def _sample_random_alphabet(self, rng: random.Random) -> str:
+        """
+        Generate a random sequence of characters from the alphabet.
+
+        Produces 3-20 characters with occasional spaces to simulate
+        random text (codes, serial numbers, mixed-language fragments).
+        This ensures every character in the alphabet gets sufficient
+        training examples regardless of language.
+        """
+        length = rng.randint(3, 20)
+        chars = []
+        for _ in range(length):
+            if rng.random() < 0.15:
+                chars.append(" ")
+            else:
+                chars.append(rng.choice(self.alphabet))
+        return normalize_text("".join(chars).strip())
 
     def _sample_text_line(self, rng: random.Random) -> str:
         """

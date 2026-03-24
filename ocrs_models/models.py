@@ -365,6 +365,82 @@ class RecognitionModel(nn.Module):
         return self.output(x)
 
 
+class RecognitionModelV2Medium(nn.Module):
+    """
+    Larger CTC recognition model for better visual feature extraction.
+
+    Same architecture as RecognitionModelV2 but with:
+    - 2x wider CNN backbone (256 channels instead of 128)
+    - Larger transformer encoder (d_model=384, nhead=6)
+    - Better at distinguishing visually similar characters (w/v, 0/o)
+    - Language-agnostic (CTC), works on all Latin-script languages
+    """
+
+    def __init__(self, alphabet: str):
+        super().__init__()
+
+        n_classes = len(alphabet) + 1
+        cnn_channels = 256
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 64, kernel_size=3, padding=(1, 1)),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=(1, 1), bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2),
+            nn.Conv2d(128, cnn_channels, kernel_size=3, padding=(1, 1)),
+            nn.ReLU(),
+            nn.Conv2d(cnn_channels, cnn_channels, kernel_size=3, padding=(1, 1), bias=False),
+            nn.BatchNorm2d(cnn_channels),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=(2, 1)),
+            nn.Conv2d(cnn_channels, cnn_channels, kernel_size=3, padding=(1, 1)),
+            nn.ReLU(),
+            nn.Conv2d(cnn_channels, cnn_channels, kernel_size=3, padding=(1, 1), bias=False),
+            nn.BatchNorm2d(cnn_channels),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=(2, 1)),
+            nn.Conv2d(cnn_channels, cnn_channels, kernel_size=(2, 2), padding=(1, 1), bias=False),
+            nn.BatchNorm2d(cnn_channels),
+            nn.AvgPool2d(kernel_size=(4, 1)),
+        )
+
+        d_model = 384
+        self.d_model = d_model
+
+        self.project = nn.Linear(cnn_channels, d_model)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=6,
+            dim_feedforward=1536,
+            dropout=0.1,
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=4)
+
+        self.output = nn.Sequential(
+            nn.Linear(d_model, n_classes),
+            nn.LogSoftmax(dim=2),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        n, c, h, w = x.shape
+        x = self.conv(x)
+        x = x.squeeze(2)
+        x = x.permute(0, 2, 1)
+        x = self.project(x)
+
+        seq_len = x.shape[1]
+        pos_enc = positional_encoding(seq_len, self.d_model).to(x.device)
+        x = x + pos_enc
+
+        x = self.encoder(x)
+        return self.output(x)
+
+
 class RecognitionModelV2(nn.Module):
     """
     Text recognition model using Transformer encoder (replaces GRU).
@@ -856,26 +932,31 @@ class RecognitionModelV2Export(nn.Module):
         torch.onnx.export(export_model, ...)
     """
 
-    def __init__(self, conv, project, d_model, output, n_layers: int = 4):
+    def __init__(self, conv, project, d_model, output, n_layers: int = 4, nhead: int = 4, dim_feedforward: int = 1024):
         super().__init__()
         self.conv = conv
         self.project = project
         self.d_model = d_model
         self.layers = nn.ModuleList(
-            [_ManualEncoderLayer(d_model, 4, 1024) for _ in range(n_layers)]
+            [_ManualEncoderLayer(d_model, nhead, dim_feedforward) for _ in range(n_layers)]
         )
         self.output = output
 
     @staticmethod
-    def from_trained(model: "RecognitionModelV2") -> "RecognitionModelV2Export":
-        """Build an export model by copying weights from a trained model."""
+    def from_trained(model) -> "RecognitionModelV2Export":
+        """Build an export model by copying weights from a trained model (v2 or v2m)."""
         n_layers = len(model.encoder.layers)
+        src_layer = model.encoder.layers[0]
+        nhead = src_layer.self_attn.num_heads
+        dim_feedforward = src_layer.linear1.out_features
         export_model = RecognitionModelV2Export(
             conv=model.conv,
             project=model.project,
             d_model=model.d_model,
             output=model.output,
             n_layers=n_layers,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
         )
 
         for i in range(n_layers):

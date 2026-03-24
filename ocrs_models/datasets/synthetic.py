@@ -167,7 +167,56 @@ _WORD_LISTS: dict[str, list[str]] = {
         "informacja", "jakość", "Polska", "Warszawa", "Kraków",
         "łódź", "Gdańsk", "Wrocław", "źródło", "między",
     ],
+    "cs": [
+        "a", "je", "na", "se", "že", "to", "ten", "být", "pro", "jako",
+        "ale", "jeho", "nebo", "který", "jen", "tak", "aby", "jsou", "rok",
+        "při", "mezi", "před", "může", "české", "česky", "město", "práce",
+        "člověk", "život", "čas", "říci", "třeba", "způsob", "část",
+        "řada", "škola", "společnost", "většina", "země", "Praha",
+        "některý", "určitý", "žádný", "nějaký", "číslo", "úřad",
+        "Čechy", "Šumava", "Žďár", "Říčany", "Ťopek", "Ňadra",
+        "věž", "nůž", "kůň", "říjen", "červen", "květen", "únor",
+    ],
+    "ro": [
+        "și", "la", "de", "în", "cu", "pe", "nu", "un", "este", "care",
+        "din", "sau", "mai", "sunt", "fost", "acest", "pentru", "prin",
+        "lui", "avea", "unei", "cele", "pot", "face", "până", "după",
+        "între", "ani", "timp", "oraș", "țară", "stat", "lume", "viață",
+        "România", "București", "număr", "guvern", "societate",
+        "informație", "calitate", "universitate", "educație",
+        "română", "politică", "economie", "știință", "cultură",
+        "Timișoara", "Constanța", "Brașov", "Iași", "Craiova",
+    ],
+    "is": [
+        "og", "að", "er", "í", "á", "um", "sem", "en", "ekki", "var",
+        "það", "við", "til", "hann", "frá", "eða", "þá", "þú", "ég",
+        "enn", "hefur", "verið", "þegar", "eftir", "yfir", "undir",
+        "land", "borg", "dagur", "ár", "líf", "maður", "kona",
+        "Ísland", "Reykjavík", "Þingvellir", "Þórshöfn",
+        "Akureyri", "söfnuður", "þjóð", "Ðrottning",
+        "veður", "sjór", "fjörður", "eyja", "jökull",
+    ],
 }
+
+# Additional character-coverage fragments to ensure every alphabet character
+# appears in the training data.
+_EXTRA_COVERAGE = [
+    # Missing uppercase accented
+    "À", "Â", "Ã", "Ä", "Å", "Æ", "Ç", "È", "Ê", "Ë", "Î", "Ï",
+    "Ð", "Ñ", "Ó", "Ô", "Õ", "Ø", "Ù", "Û", "Þ",
+    # Missing lowercase
+    "â", "å", "æ", "ë", "î", "ï", "ð", "ô", "õ", "ø", "û", "þ",
+    # Missing diacritics
+    "Ă", "ă", "Ą", "Ć", "Č", "č", "Ď", "ď", "Ę", "Ğ", "Ł", "Ń",
+    "Ň", "ň", "Œ", "œ", "Ř", "ř", "Ś", "Ş", "Š", "š", "Ť", "ť",
+    "Ź", "Ż", "Ž", "ž", "Ș", "ș", "Ț", "ț",
+    # Missing symbols/punctuation
+    '"', "&", "(", ")", "*", "+", "-", "/",
+    "<", "=", ">", "@", "[", "\\", "]", "^", "_", "`", "{", "|", "}", "~",
+    "†", "‡", "™", "÷", "×", "¶",
+    # Missing digits/letters
+    "7", "8", "O", "Q", "V", "X", "Y",
+]
 
 
 def _discover_system_fonts() -> list[str]:
@@ -282,6 +331,8 @@ class SyntheticTextDataset(SizedDataset):
             self._word_pool.extend(lang_words)
         self._word_pool.extend(_COMMON_NUMBERS)
         self._word_pool.extend(_SPECIAL_FRAGMENTS)
+        self._word_pool.extend(_EXTRA_COVERAGE)
+        self._word_pool.extend(_PUNCTUATION_FRAGMENTS)
 
     # ------------------------------------------------------------------
     # Dataset interface

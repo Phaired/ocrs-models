@@ -12,6 +12,7 @@ import wandb
 
 from .datasets.combined import CombinedDataset
 from .datasets.hiertext import DEFAULT_ALPHABET, HierTextRecognition
+from .datasets.synthetic import SyntheticTextDataset
 from .datasets.textocr import TextOCRRecognition
 from .datasets.util import ctc_greedy_decode_text, decode_text
 from .datasets import text_recognition_data_augmentations
@@ -319,7 +320,7 @@ def collate_samples(samples: list[dict]) -> dict:
 
 def main():
     parser = ArgumentParser(description="Train text recognition model.")
-    parser.add_argument("dataset_type", type=str, choices=["hiertext", "textocr", "combined"])
+    parser.add_argument("dataset_type", type=str, choices=["hiertext", "textocr", "combined", "multilingual"])
     parser.add_argument("data_dir")
     parser.add_argument(
         "--augment",
@@ -361,7 +362,7 @@ def main():
         load_dataset = HierTextRecognition
     elif args.dataset_type == "textocr":
         load_dataset = TextOCRRecognition
-    elif args.dataset_type == "combined":
+    elif args.dataset_type in ("combined", "multilingual"):
         load_dataset = None  # handled below
     else:
         raise Exception(f"Unknown dataset type {args.dataset_type}")
@@ -377,7 +378,30 @@ def main():
     else:
         augmentations = None
 
-    if args.dataset_type == "combined":
+    if args.dataset_type == "multilingual":
+        # HierText + TextOCR + Synthetic multilingual: 50/20/30
+        hiertext_train = HierTextRecognition(
+            args.data_dir, train=True, max_images=max_images, transform=augmentations
+        )
+        datasets = [hiertext_train]
+        ratios = [0.5]
+        if args.textocr_dir:
+            textocr_train = TextOCRRecognition(
+                args.textocr_dir, train=True, max_images=max_images, transform=augmentations
+            )
+            datasets.append(textocr_train)
+            ratios.append(0.2)
+            synth_ratio = 0.3
+        else:
+            synth_ratio = 0.5
+        synth_size = int(len(hiertext_train) * synth_ratio / ratios[0])
+        synthetic_train = SyntheticTextDataset(
+            num_samples=synth_size, alphabet=DEFAULT_ALPHABET, transform=augmentations
+        )
+        datasets.append(synthetic_train)
+        ratios.append(synth_ratio)
+        train_dataset = CombinedDataset(datasets=datasets, ratios=ratios)
+    elif args.dataset_type == "combined":
         if not args.textocr_dir:
             raise Exception("--textocr-dir required for combined dataset")
         hiertext_train = HierTextRecognition(
@@ -405,7 +429,7 @@ def main():
         persistent_workers=args.num_workers > 0,
     )
 
-    if args.dataset_type == "combined":
+    if args.dataset_type in ("combined", "multilingual"):
         # Validate on HierText only (consistent baseline)
         val_dataset = HierTextRecognition(
             args.data_dir, train=False, max_images=validation_max_images

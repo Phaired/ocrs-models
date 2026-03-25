@@ -786,55 +786,108 @@ class RecognitionModelV3Export(nn.Module):
     The autoregressive loop happens in the Rust runtime.
     """
 
-    def __init__(self, conv, project, d_model, encoder_layers, decoder, token_embedding, output_proj):
+    def __init__(self, conv, project, d_model, encoder_layers, decoder_layers, token_embedding, output_proj):
         super().__init__()
         self.conv = conv
         self.project = project
         self.d_model = d_model
         self.encoder_layers = encoder_layers
-        self.decoder = decoder
+        self.decoder_layers = decoder_layers
         self.token_embedding = token_embedding
         self.output_proj = output_proj
 
     @staticmethod
+    def _copy_encoder_weights(src, dst):
+        """Copy weights from a PyTorch TransformerEncoderLayer to a _ManualEncoderLayer."""
+        dst.self_attn.qkv_proj.weight.data = src.self_attn.in_proj_weight.data
+        dst.self_attn.qkv_proj.bias.data = src.self_attn.in_proj_bias.data
+        dst.self_attn.out_proj.weight.data = src.self_attn.out_proj.weight.data
+        dst.self_attn.out_proj.bias.data = src.self_attn.out_proj.bias.data
+        dst.linear1.weight.data = src.linear1.weight.data
+        dst.linear1.bias.data = src.linear1.bias.data
+        dst.linear2.weight.data = src.linear2.weight.data
+        dst.linear2.bias.data = src.linear2.bias.data
+        dst.norm1.weight.data = src.norm1.weight.data
+        dst.norm1.bias.data = src.norm1.bias.data
+        dst.norm2.weight.data = src.norm2.weight.data
+        dst.norm2.bias.data = src.norm2.bias.data
+
+    @staticmethod
+    def _copy_decoder_weights(src, dst):
+        """Copy weights from a PyTorch TransformerDecoderLayer to a _ManualDecoderLayer."""
+        # Self-attention (in decoder, self_attn uses in_proj_weight for qkv)
+        dst.self_attn.qkv_proj.weight.data = src.self_attn.in_proj_weight.data
+        dst.self_attn.qkv_proj.bias.data = src.self_attn.in_proj_bias.data
+        dst.self_attn.out_proj.weight.data = src.self_attn.out_proj.weight.data
+        dst.self_attn.out_proj.bias.data = src.self_attn.out_proj.bias.data
+
+        # Cross-attention (multihead_attn in PyTorch decoder)
+        # PyTorch stores q, k, v projections in in_proj_weight [3*d, d]
+        d = src.multihead_attn.embed_dim
+        in_proj_w = src.multihead_attn.in_proj_weight.data
+        in_proj_b = src.multihead_attn.in_proj_bias.data
+        dst.cross_attn.q_proj.weight.data = in_proj_w[:d]
+        dst.cross_attn.q_proj.bias.data = in_proj_b[:d]
+        dst.cross_attn.k_proj.weight.data = in_proj_w[d:2*d]
+        dst.cross_attn.k_proj.bias.data = in_proj_b[d:2*d]
+        dst.cross_attn.v_proj.weight.data = in_proj_w[2*d:]
+        dst.cross_attn.v_proj.bias.data = in_proj_b[2*d:]
+        dst.cross_attn.out_proj.weight.data = src.multihead_attn.out_proj.weight.data
+        dst.cross_attn.out_proj.bias.data = src.multihead_attn.out_proj.bias.data
+
+        # FFN
+        dst.linear1.weight.data = src.linear1.weight.data
+        dst.linear1.bias.data = src.linear1.bias.data
+        dst.linear2.weight.data = src.linear2.weight.data
+        dst.linear2.bias.data = src.linear2.bias.data
+
+        # Norms (decoder has 3: norm1=self_attn, norm2=cross_attn, norm3=ffn)
+        dst.norm1.weight.data = src.norm1.weight.data
+        dst.norm1.bias.data = src.norm1.bias.data
+        dst.norm2.weight.data = src.norm2.weight.data
+        dst.norm2.bias.data = src.norm2.bias.data
+        dst.norm3.weight.data = src.norm3.weight.data
+        dst.norm3.bias.data = src.norm3.bias.data
+
+    @staticmethod
     def from_trained(model: "RecognitionModelV3") -> "RecognitionModelV3Export":
         """Build export model from trained model."""
-        n_layers = len(model.encoder.layers)
+        d_model = model.d_model
+        nhead = model.encoder.layers[0].self_attn.num_heads
+        enc_ff = model.encoder.layers[0].linear1.out_features
+        dec_ff = model.decoder.layers[0].linear1.out_features
+
+        # Build manual encoder layers
+        n_enc = len(model.encoder.layers)
         encoder_layers = nn.ModuleList(
-            [_ManualEncoderLayer(model.d_model, 4, 1024) for _ in range(n_layers)]
+            [_ManualEncoderLayer(d_model, nhead, enc_ff) for _ in range(n_enc)]
         )
-        # Copy encoder weights
-        for i in range(n_layers):
-            src = model.encoder.layers[i]
-            dst = encoder_layers[i]
-            dst.self_attn.qkv_proj.weight.data = src.self_attn.in_proj_weight.data
-            dst.self_attn.qkv_proj.bias.data = src.self_attn.in_proj_bias.data
-            dst.self_attn.out_proj.weight.data = src.self_attn.out_proj.weight.data
-            dst.self_attn.out_proj.bias.data = src.self_attn.out_proj.bias.data
-            dst.linear1.weight.data = src.linear1.weight.data
-            dst.linear1.bias.data = src.linear1.bias.data
-            dst.linear2.weight.data = src.linear2.weight.data
-            dst.linear2.bias.data = src.linear2.bias.data
-            dst.norm1.weight.data = src.norm1.weight.data
-            dst.norm1.bias.data = src.norm1.bias.data
-            dst.norm2.weight.data = src.norm2.weight.data
-            dst.norm2.bias.data = src.norm2.bias.data
+        for i in range(n_enc):
+            RecognitionModelV3Export._copy_encoder_weights(
+                model.encoder.layers[i], encoder_layers[i]
+            )
+
+        # Build manual decoder layers
+        n_dec = len(model.decoder.layers)
+        decoder_layers = nn.ModuleList(
+            [_ManualDecoderLayer(d_model, nhead, dec_ff) for _ in range(n_dec)]
+        )
+        for i in range(n_dec):
+            RecognitionModelV3Export._copy_decoder_weights(
+                model.decoder.layers[i], decoder_layers[i]
+            )
 
         return RecognitionModelV3Export(
             conv=model.conv,
             project=model.project,
-            d_model=model.d_model,
+            d_model=d_model,
             encoder_layers=encoder_layers,
-            decoder=model.decoder,
+            decoder_layers=decoder_layers,
             token_embedding=model.token_embedding,
             output_proj=model.output_proj,
         )
 
     def forward(self, image: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
-        """
-        Single forward pass: encode image + decode tokens.
-        The Rust runtime calls this repeatedly with growing token sequences.
-        """
         # Encode
         x = self.conv(image)
         x = x.squeeze(2).permute(0, 2, 1)
@@ -844,23 +897,26 @@ class RecognitionModelV3Export(nn.Module):
         pos_enc = positional_encoding(seq_len, self.d_model).to(x.device)
         x = x + pos_enc
 
-        # Manual encoder (ONNX-friendly)
-        x = x.permute(1, 0, 2)  # [seq, batch, d]
+        # Manual encoder [batch, seq, d] -> [seq, batch, d]
+        x = x.permute(1, 0, 2)
         for layer in self.encoder_layers:
             x = layer(x)
-        memory = x.permute(1, 0, 2)  # [batch, seq, d]
+        memory = x  # keep as [seq, batch, d]
 
         # Decode
-        tgt_len = tokens.shape[1]
-        tgt = self.token_embedding(tokens)
+        tgt = self.token_embedding(tokens)  # [batch, tgt_len, d]
+        tgt_len = tgt.shape[1]
         tgt_pos = positional_encoding(tgt_len, self.d_model).to(tgt.device)
         tgt = tgt + tgt_pos
 
-        causal_mask = nn.Transformer.generate_square_subsequent_mask(
-            tgt_len, device=tgt.device
-        )
-        out = self.decoder(tgt, memory, tgt_mask=causal_mask)
-        return self.output_proj(out)  # [N, tgt_len, vocab_size]
+        # [batch, tgt_len, d] -> [tgt_len, batch, d]
+        tgt = tgt.permute(1, 0, 2)
+        for layer in self.decoder_layers:
+            tgt = layer(tgt, memory)
+        # [tgt_len, batch, d] -> [batch, tgt_len, d]
+        tgt = tgt.permute(1, 0, 2)
+
+        return self.output_proj(tgt)
 
 
 class _ManualMultiheadAttention(nn.Module):
@@ -880,7 +936,7 @@ class _ManualMultiheadAttention(nn.Module):
         self.qkv_proj = nn.Linear(d_model, 3 * d_model)
         self.out_proj = nn.Linear(d_model, d_model)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, causal: bool = False) -> torch.Tensor:
         seq, batch, _ = x.shape
         qkv = self.qkv_proj(x)
         q, k, v = qkv.chunk(3, dim=-1)
@@ -890,11 +946,85 @@ class _ManualMultiheadAttention(nn.Module):
         v = v.reshape(seq, batch * self.nhead, self.d_k).transpose(0, 1)
 
         scores = torch.matmul(q, k.transpose(-2, -1)) / (self.d_k**0.5)
+
+        if causal:
+            mask = torch.triu(torch.ones(seq, seq, device=scores.device), diagonal=1).bool()
+            scores = scores.masked_fill(mask.unsqueeze(0), float('-inf'))
+
         attn = torch.softmax(scores, dim=-1)
         out = torch.matmul(attn, v)
 
         out = out.transpose(0, 1).reshape(seq, batch, self.d_model)
         return self.out_proj(out)
+
+    def forward_causal(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward(x, causal=True)
+
+
+class _ManualCrossAttention(nn.Module):
+    """Cross-attention using simple ops for clean ONNX export.
+
+    Query comes from the decoder, key/value from the encoder memory.
+    """
+
+    def __init__(self, d_model: int, nhead: int):
+        super().__init__()
+        self.nhead = nhead
+        self.d_k = d_model // nhead
+        self.d_model = d_model
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+    def forward(self, query: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+        """
+        :param query: [seq_q, batch, d_model] from decoder
+        :param memory: [seq_m, batch, d_model] from encoder
+        """
+        seq_q, batch, _ = query.shape
+        seq_m = memory.shape[0]
+
+        q = self.q_proj(query)
+        k = self.k_proj(memory)
+        v = self.v_proj(memory)
+
+        q = q.reshape(seq_q, batch * self.nhead, self.d_k).transpose(0, 1)
+        k = k.reshape(seq_m, batch * self.nhead, self.d_k).transpose(0, 1)
+        v = v.reshape(seq_m, batch * self.nhead, self.d_k).transpose(0, 1)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) / (self.d_k ** 0.5)
+        attn = torch.softmax(scores, dim=-1)
+        out = torch.matmul(attn, v)
+
+        out = out.transpose(0, 1).reshape(seq_q, batch, self.d_model)
+        return self.out_proj(out)
+
+
+class _ManualDecoderLayer(nn.Module):
+    """Transformer decoder layer with manual attention for ONNX export."""
+
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int):
+        super().__init__()
+        self.self_attn = _ManualMultiheadAttention(d_model, nhead)
+        self.cross_attn = _ManualCrossAttention(d_model, nhead)
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+
+    def forward(self, tgt: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+        # Self-attention with causal mask
+        x2 = self.self_attn.forward_causal(tgt)
+        tgt = self.norm1(tgt + x2)
+        # Cross-attention
+        x2 = self.cross_attn(tgt, memory)
+        tgt = self.norm2(tgt + x2)
+        # FFN
+        x2 = self.linear2(torch.relu(self.linear1(tgt)))
+        tgt = self.norm3(tgt + x2)
+        return tgt
 
 
 class _ManualEncoderLayer(nn.Module):

@@ -140,10 +140,18 @@ def train_epoch(
     dataloader: DataLoader,
     model: RecognitionModelV3,
     optimizer: torch.optim.Optimizer,
+    sampling_ratio: float = 0.0,
 ) -> tuple[float, V3AccuracyStats]:
+    """
+    Train one epoch with scheduled sampling.
+
+    :param sampling_ratio: Fraction of tokens replaced by model's own predictions
+        instead of ground truth. 0.0 = pure teacher forcing, 1.0 = fully autoregressive.
+        Should ramp from 0 to ~0.5 over training.
+    """
     model.train()
     train_iter = tqdm(dataloader)
-    train_iter.set_description(f"Training (epoch {epoch})")
+    train_iter.set_description(f"Training (epoch {epoch}, ss={sampling_ratio:.2f})")
     total_loss = 0.0
     stats = V3AccuracyStats()
 
@@ -155,13 +163,29 @@ def train_epoch(
         optimizer.zero_grad()
 
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-            # Teacher forcing: input is tokens[:-1], target is tokens[1:]
-            decoder_input = tgt_tokens[:, :-1]
             decoder_target = tgt_tokens[:, 1:]
 
-            logits = model(img, decoder_input)  # [N, seq-1, vocab]
+            # Scheduled sampling: mix ground truth with model predictions
+            if sampling_ratio > 0:
+                memory = model.encode(img)
+                decoder_input = tgt_tokens[:, :-1].clone()
+                seq_len = decoder_input.shape[1]
 
-            # Cross-entropy loss, ignoring PAD tokens
+                # For each position after the first (SOS), maybe use model prediction
+                with torch.no_grad():
+                    for t in range(1, seq_len):
+                        if torch.rand(1).item() < sampling_ratio:
+                            # Use model's prediction for this position
+                            logits_t = model.decode(memory, decoder_input[:, :t])
+                            pred_t = logits_t[:, -1, :].argmax(dim=-1)
+                            decoder_input[:, t] = pred_t
+
+                logits = model.decode(memory, decoder_input)
+            else:
+                # Pure teacher forcing
+                decoder_input = tgt_tokens[:, :-1]
+                logits = model(img, decoder_input)
+
             loss = F.cross_entropy(
                 logits.reshape(-1, logits.shape[-1]),
                 decoder_target.reshape(-1),
@@ -178,7 +202,7 @@ def train_epoch(
 
         # Compute accuracy on greedy predictions
         with torch.no_grad():
-            pred_tokens = logits.argmax(dim=-1)  # [N, seq-1]
+            pred_tokens = logits.argmax(dim=-1)
             pred_texts = []
             target_texts = []
             for i in range(pred_tokens.shape[0]):
@@ -186,7 +210,6 @@ def train_epoch(
                 target_texts.append(model.decode_tokens(decoder_target[i]))
             stats.update(pred_texts, target_texts)
 
-        # Preview first batch
         if batch_idx == 0:
             for i in range(min(5, len(pred_texts))):
                 print(f'  Train: "{pred_texts[i]}" <- "{target_texts[i]}"')
@@ -201,9 +224,10 @@ def validate(
     dataloader: DataLoader,
     model: RecognitionModelV3,
 ) -> tuple[float, V3AccuracyStats]:
+    """Validate using real autoregressive decoding (not teacher-forced)."""
     model.eval()
     val_iter = tqdm(dataloader)
-    val_iter.set_description("Validating")
+    val_iter.set_description("Validating (autoregressive)")
     total_loss = 0.0
     stats = V3AccuracyStats()
 
@@ -212,11 +236,10 @@ def validate(
         tgt_tokens = batch["tgt_tokens"].to(device)
         tgt_lengths = batch["tgt_length"]
 
+        # Teacher-forced loss (for checkpointing)
         decoder_input = tgt_tokens[:, :-1]
         decoder_target = tgt_tokens[:, 1:]
-
         logits = model(img, decoder_input)
-
         loss = F.cross_entropy(
             logits.reshape(-1, logits.shape[-1]),
             decoder_target.reshape(-1),
@@ -224,18 +247,18 @@ def validate(
         )
         total_loss += loss.item()
 
-        # Greedy decode from logits (teacher-forced)
-        pred_tokens = logits.argmax(dim=-1)
+        # Autoregressive CER (real metric)
+        result_tokens = model.inference(model.encode(img))
         pred_texts = []
         target_texts = []
-        for i in range(pred_tokens.shape[0]):
-            pred_texts.append(model.decode_tokens(pred_tokens[i]))
+        for i in range(result_tokens.shape[0]):
+            pred_texts.append(model.decode_tokens(result_tokens[i]))
             target_texts.append(model.decode_tokens(decoder_target[i]))
         stats.update(pred_texts, target_texts)
 
         if batch_idx == 0:
             for i in range(min(5, len(pred_texts))):
-                print(f'  Val: "{pred_texts[i]}" <- "{target_texts[i]}"')
+                print(f'  Val (AR): "{pred_texts[i][:60]}" <- "{target_texts[i][:60]}"')
 
     val_iter.clear()
     return total_loss / len(dataloader), stats
@@ -352,17 +375,26 @@ def main():
         print(f"Val loss {val_loss:.4f} CER {val_stats.char_error_rate():.4f}")
         return
 
-    # Training loop
+    # Training loop with scheduled sampling
     best_val_loss = float("inf")
-    patience = 10
+    patience = 30
     no_improve = 0
 
+    # Scheduled sampling: ramp from 0 to max_ss_ratio over ss_warmup epochs
+    ss_warmup = 20  # epochs to ramp up scheduled sampling
+    max_ss_ratio = 0.5  # max fraction of tokens from model predictions
+
     while epoch < args.max_epochs:
-        train_loss, train_stats = train_epoch(epoch, device, train_loader, model, optimizer)
+        # Compute scheduled sampling ratio for this epoch
+        ss_ratio = min(max_ss_ratio, max_ss_ratio * epoch / max(1, ss_warmup))
+
+        train_loss, train_stats = train_epoch(
+            epoch, device, train_loader, model, optimizer, sampling_ratio=ss_ratio
+        )
         print(f"Epoch {epoch} train loss {train_loss:.4f} CER {train_stats.char_error_rate():.4f}")
 
         val_loss, val_stats = validate(device, val_loader, model)
-        print(f"Epoch {epoch} val loss {val_loss:.4f} CER {val_stats.char_error_rate():.4f}")
+        print(f"Epoch {epoch} val loss {val_loss:.4f} AR-CER {val_stats.char_error_rate():.4f}")
 
         scheduler.step()
         print(f"LR {scheduler.get_last_lr()}")
